@@ -229,15 +229,71 @@ async def fetch_rss_feed(
         return [], str(exc)
 
 
+async def fetch_remotive_jobs() -> list[dict[str, Any]]:
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+
+            response = await client.get(
+                "https://remotive.com/api/remote-jobs"
+            )
+
+            response.raise_for_status()
+
+            data = response.json()
+
+        jobs = []
+
+        for job in data.get("jobs", [])[:100]:
+
+            jobs.append(
+                {
+                    "title": job.get("title", ""),
+                    "description": job.get("description", ""),
+                    "budget": None,
+                    "url": job.get("url", ""),
+                    "source": "Remotive",
+                }
+            )
+
+        logger.info(
+            "Fetched %d jobs from Remotive",
+            len(jobs)
+        )
+
+        return jobs
+
+    except Exception as exc:
+
+        logger.exception(
+            "Remotive fetch failed"
+        )
+
+        return []
+
+
+
 async def fetch_all_jobs() -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     feed_errors: list[dict[str, str]] = []
     all_jobs: list[dict[str, Any]] = []
     seen_urls: set[str] = set()
 
-    tasks = [fetch_rss_feed(f["url"], f["source"]) for f in RSS_FEEDS]
-    results = await asyncio.gather(*tasks)
+    tasks = [
+        fetch_rss_feed(
+            f["url"],
+            f["source"]
+        )
+        for f in RSS_FEEDS
+    ]
 
-    for feed_cfg, (jobs, error) in zip(RSS_FEEDS, results):
+    rss_results = await asyncio.gather(*tasks)
+
+    remotive_jobs = await fetch_remotive_jobs()
+
+    #for feed_cfg, (jobs, error) in zip(RSS_FEEDS, results):
+    for feed_cfg, (jobs, error) in zip(
+        RSS_FEEDS,
+        rss_results
+    ):
         if error:
             feed_errors.append(
                 {
@@ -253,6 +309,19 @@ async def fetch_all_jobs() -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
                 seen_urls.add(job["url"])
             all_jobs.append(job)
 
+    for job in remotive_jobs:
+
+        if (
+            job["url"]
+            and job["url"] not in seen_urls
+        ):
+            seen_urls.add(job["url"])
+            all_jobs.append(job)
+
+    logger.info(
+        "Total jobs after merge: %d",
+        len(all_jobs)
+    )
     return all_jobs, feed_errors
 
 
@@ -367,6 +436,7 @@ async def match_jobs(body: MatchJobsRequest) -> MatchJobsResponse:
     )
 
     raw_jobs, feed_errors = await fetch_all_jobs()
+    
     skill_tokens = tokenize(body.skills)
 
     filtered_jobs = []
@@ -383,7 +453,7 @@ async def match_jobs(body: MatchJobsRequest) -> MatchJobsResponse:
             if token in text
         )
 
-        if overlap > 0:
+        if overlap >= 1:  # Require at least 2 skill matches for initial filtering
             filtered_jobs.append(job)
 
     raw_jobs = filtered_jobs or raw_jobs
@@ -404,7 +474,7 @@ async def match_jobs(body: MatchJobsRequest) -> MatchJobsResponse:
 
     scored: list[JobMatch] = []
 
-    for job in raw_jobs[:50]:
+    for job in raw_jobs[:25]:
         desc = job["description"] or job["title"]
         kw_score = keyword_baseline_score(body.skills, desc)
 
