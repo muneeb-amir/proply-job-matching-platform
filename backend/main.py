@@ -4,9 +4,9 @@ import logging
 import os
 import re
 from typing import Any, Literal
-
 import feedparser
 import google.generativeai as genai
+#from sentence_transformers import SentenceTransformer
 import httpx
 import numpy as np
 from dotenv import load_dotenv
@@ -26,6 +26,7 @@ load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("proply")
+#embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
@@ -33,28 +34,16 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-EMBED_MODEL = "models/gemini-2.0-flash"
-EMBED_FALLBACK_MODEL = "models/text-embedding-004"
-GENERATION_MODEL = "gemini-2.0-flash"
+#EMBED_MODEL = "models/text-embedding-004"
+#EMBED_FALLBACK_MODEL = "models/text-embedding-004"
+GENERATION_MODEL = "gemini-2.5-flash"
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
 RSS_FEEDS = [
     {
-        "url": "https://www.upwork.com/ab/feed/jobs/rss?q=python&sort=recency",
-        "source": "Upwork",
-    },
-    {
-        "url": "https://www.upwork.com/ab/feed/jobs/rss?q=web+development&sort=recency",
-        "source": "Upwork",
-    },
-    {
-        "url": "https://www.upwork.com/ab/feed/jobs/rss?q=machine+learning&sort=recency",
-        "source": "Upwork",
-    },
-    {
         "url": "https://www.freelancer.com/rss.xml",
         "source": "Freelancer",
-    },
+    }
 ]
 
 app = FastAPI(title="Proply API", version="1.0.0")
@@ -157,33 +146,25 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     return float(np.dot(va, vb) / (norm_a * norm_b))
 
 
-def _embed_sync(text: str, model: str) -> list[float]:
-    result = genai.embed_content(
-        model=model,
-        content=text[:8000],
-        task_type="SEMANTIC_SIMILARITY",
+def _embed_sync(text: str) -> list[float]:
+    embedding = embedding_model.encode(
+        text[:8000],
+        convert_to_numpy=True
     )
-    return result["embedding"]
+    return embedding.tolist()
 
 
 async def embed_text(text: str) -> list[float]:
-    """Embed text using Gemini embedContent with SEMANTIC_SIMILARITY."""
-
     try:
-        return await asyncio.to_thread(_embed_sync, text, EMBED_MODEL)
-    except Exception as primary_exc:
-        logger.warning(
-            "Primary embed model %s failed, trying fallback: %s",
-            EMBED_MODEL,
-            primary_exc,
+        return await asyncio.to_thread(
+            _embed_sync,
+            text
         )
-        try:
-            return await asyncio.to_thread(_embed_sync, text, EMBED_FALLBACK_MODEL)
-        except Exception as fallback_exc:
-            raise HTTPException(
-                status_code=503,
-                detail=f"Embedding failed: {fallback_exc}",
-            ) from fallback_exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Embedding failed: {exc}",
+        ) from exc
 
 
 def parse_budget(entry: dict[str, Any]) -> str | None:
@@ -309,6 +290,51 @@ async def generate_with_gemini(prompt: str, system: str) -> str:
 
     return await asyncio.to_thread(_call)
 
+async def score_job_relevance(
+    skills: str,
+    experience: str,
+    job_title: str,
+    job_description: str,
+) -> float:
+
+    prompt = f"""
+User Skills:
+{skills}
+
+Experience Level:
+{experience}
+
+Job Title:
+{job_title}
+
+Job Description:
+{job_description[:2500]}
+
+Rate how suitable this job is for the user.
+
+Return ONLY a number between 0 and 100.
+"""
+
+    model = genai.GenerativeModel(GENERATION_MODEL)
+
+    def _call():
+        response = model.generate_content(prompt)
+        text = response.text.strip()
+
+        match = re.search(r"\d+", text)
+        if match:
+            return float(match.group())
+
+        return 50.0
+
+    try:
+        return await asyncio.to_thread(_call)
+    except Exception:
+        return 50.0
+
+
+
+
 
 PROPOSAL_SYSTEM = (
     "You are an expert freelance proposal writer. Write winning proposals that are "
@@ -341,6 +367,26 @@ async def match_jobs(body: MatchJobsRequest) -> MatchJobsResponse:
     )
 
     raw_jobs, feed_errors = await fetch_all_jobs()
+    skill_tokens = tokenize(body.skills)
+
+    filtered_jobs = []
+
+    for job in raw_jobs:
+
+        text = (
+            job["title"] + " " +
+            job["description"]
+        ).lower()
+
+        overlap = sum(
+            1 for token in skill_tokens
+            if token in text
+        )
+
+        if overlap > 0:
+            filtered_jobs.append(job)
+
+    raw_jobs = filtered_jobs or raw_jobs
     logger.info("Fetched %d jobs from RSS feeds", len(raw_jobs))
 
     if not raw_jobs:
@@ -354,7 +400,7 @@ async def match_jobs(body: MatchJobsRequest) -> MatchJobsResponse:
         f"Hourly rate: {body.hourly_rate or 'not specified'}."
     )
 
-    user_embedding = await embed_text(profile_text)
+    #user_embedding = await embed_text(profile_text)
 
     scored: list[JobMatch] = []
 
@@ -363,9 +409,16 @@ async def match_jobs(body: MatchJobsRequest) -> MatchJobsResponse:
         kw_score = keyword_baseline_score(body.skills, desc)
 
         try:
-            job_embedding = await embed_text(desc[:8000])
-            similarity = cosine_similarity(user_embedding, job_embedding)
-            match_pct = round(max(0.0, min(100.0, similarity * 100)), 1)
+            match_pct = await score_job_relevance(
+                body.skills,
+                body.experience_level,
+                job["title"],
+                desc,
+            )
+
+            #job_embedding = await embed_text(desc[:8000])
+            #similarity = cosine_similarity(user_embedding, job_embedding)
+            #match_pct = round(max(0.0, min(100.0, similarity * 100)), 1)
         except HTTPException:
             raise
         except Exception as exc:
