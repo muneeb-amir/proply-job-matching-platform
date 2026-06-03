@@ -19,10 +19,24 @@ interface JobCardProps {
 }
 
 function sourceBadgeClass(source: string) {
-  if (source.toLowerCase() === "upwork") {
-    return "bg-green-500/15 text-green-400 border-green-500/30";
+
+  switch (source.toLowerCase()) {
+
+    case "freelancer":
+      return "bg-blue-500/15 text-blue-400 border-blue-500/30";
+
+    case "remotive":
+      return "bg-purple-500/15 text-purple-400 border-purple-500/30";
+
+    case "remoteok":
+      return "bg-orange-500/15 text-orange-400 border-orange-500/30";
+
+    case "upwork":
+      return "bg-green-500/15 text-green-400 border-green-500/30";
+
+    default:
+      return "bg-slate-500/15 text-slate-400 border-slate-500/30";
   }
-  return "bg-blue-500/15 text-blue-400 border-blue-500/30";
 }
 
 export function JobCard({ job, onWriteProposal }: JobCardProps) {

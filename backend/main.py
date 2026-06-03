@@ -367,40 +367,89 @@ async def score_job_relevance(
 ) -> float:
 
     prompt = f"""
-User Skills:
+You are an expert freelance job matching engine.
+
+USER PROFILE
+
+Skills:
 {skills}
 
 Experience Level:
 {experience}
 
-Job Title:
+JOB
+
+Title:
 {job_title}
 
-Job Description:
+Description:
 {job_description[:2500]}
 
-Rate how suitable this job is for the user.
+TASK
 
-Return ONLY a number between 0 and 100.
+Score how relevant this job is for the user.
+
+Scoring guide:
+
+100 = perfect fit
+80-99 = strong fit
+60-79 = relevant
+40-59 = weak fit
+0-39 = unrelated
+
+Consider:
+- skill overlap
+- technology overlap
+- experience match
+- job category relevance
+
+Return ONLY a single integer between 0 and 100.
+
+Examples:
+
+95
+
+72
+
+18
 """
 
     model = genai.GenerativeModel(GENERATION_MODEL)
 
-    def _call():
+    def _call() -> float:
+
         response = model.generate_content(prompt)
-        text = response.text.strip()
 
-        match = re.search(r"\d+", text)
-        if match:
-            return float(match.group())
+        text = (response.text or "").strip()
 
-        return 50.0
+        logger.info(
+            "Gemini relevance score for '%s': %s",
+            job_title,
+            text,
+        )
+
+        numbers = re.findall(r"\d+", text)
+
+        if not numbers:
+            return 0.0
+
+        score = int(numbers[0])
+
+        score = max(0, min(score, 100))
+
+        return float(score)
 
     try:
         return await asyncio.to_thread(_call)
-    except Exception:
-        return 50.0
 
+    except Exception as exc:
+
+        logger.exception(
+            "Job relevance scoring failed for %s",
+            job_title,
+        )
+
+        return 0.0
 
 
 
@@ -485,6 +534,7 @@ async def match_jobs(body: MatchJobsRequest) -> MatchJobsResponse:
                 job["title"],
                 desc,
             )
+            
 
             #job_embedding = await embed_text(desc[:8000])
             #similarity = cosine_similarity(user_embedding, job_embedding)
@@ -495,6 +545,7 @@ async def match_jobs(body: MatchJobsRequest) -> MatchJobsResponse:
             logger.warning("Job embedding failed for %s: %s", job["title"], exc)
             match_pct = kw_score
 
+    if match_pct >= 40:
         scored.append(
             JobMatch(
                 title=job["title"],
